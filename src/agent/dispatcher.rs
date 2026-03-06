@@ -133,6 +133,13 @@ impl Agent {
             reasoning = reasoning.with_skill_context(ctx);
         }
 
+        // Capture the original user intent for LLM judge evaluation.
+        // We use the current message content — this is the user's stated goal
+        // for this agentic turn. Only the intent is passed to the judge (NOT
+        // the full conversation history) to prevent poisoned context from
+        // influencing the judge verdict.
+        let original_user_intent = message.content.clone();
+
         // Build context with messages that we'll mutate during the loop
         let mut context_messages = initial_messages;
 
@@ -541,7 +548,12 @@ impl Agent {
                                 .await;
 
                             let result = self
-                                .execute_chat_tool(&tc.name, &tc.arguments, &job_ctx)
+                                .execute_chat_tool(
+                                    &tc.name,
+                                    &tc.arguments,
+                                    &job_ctx,
+                                    &original_user_intent,
+                                )
                                 .await;
 
                             let disp_tool = self.tools().get(&tc.name).await;
@@ -574,6 +586,7 @@ impl Agent {
                             let tc = tc.clone();
                             let channel = message.channel.clone();
                             let metadata = message.metadata.clone();
+                            let intent = original_user_intent.clone();
 
                             join_set.spawn(async move {
                                 let _ = channels
@@ -592,6 +605,7 @@ impl Agent {
                                     &tc.name,
                                     &tc.arguments,
                                     &job_ctx,
+                                    &intent,
                                 )
                                 .await;
 
@@ -853,13 +867,26 @@ impl Agent {
     }
 
     /// Execute a tool for chat (without full job context).
+    ///
+    /// `original_user_intent` is passed to the LLM judge when enabled.
+    /// Pass `""` for approval-resumed executions where the user already
+    /// explicitly authorised the tool call.
     pub(super) async fn execute_chat_tool(
         &self,
         tool_name: &str,
         params: &serde_json::Value,
         job_ctx: &JobContext,
+        original_user_intent: &str,
     ) -> Result<String, Error> {
-        execute_chat_tool_standalone(self.tools(), self.safety(), tool_name, params, job_ctx).await
+        execute_chat_tool_standalone(
+            self.tools(),
+            self.safety(),
+            tool_name,
+            params,
+            job_ctx,
+            original_user_intent,
+        )
+        .await
     }
 }
 
@@ -868,12 +895,16 @@ impl Agent {
 /// This standalone function enables parallel invocation from spawned JoinSet
 /// tasks, which cannot borrow `&self`. It replicates the logic from
 /// `Agent::execute_chat_tool`.
+///
+/// `original_user_intent` is forwarded to the LLM judge when enabled.
+/// Pass `""` to skip judge evaluation (e.g. for approval-resumed calls).
 pub(super) async fn execute_chat_tool_standalone(
     tools: &crate::tools::ToolRegistry,
     safety: &crate::safety::SafetyLayer,
     tool_name: &str,
     params: &serde_json::Value,
     job_ctx: &crate::context::JobContext,
+    original_user_intent: &str,
 ) -> Result<String, Error> {
     let tool = tools
         .get(tool_name)
@@ -896,6 +927,15 @@ pub(super) async fn execute_chat_tool_standalone(
             reason: format!("Invalid tool parameters: {}", details),
         }
         .into());
+    }
+
+    // LLM-as-Judge: semantic evaluation AFTER heuristic checks, BEFORE execution.
+    // No-op when SAFETY_LLM_JUDGE_ENABLED=false (default) or intent is empty
+    // (approval-resumed calls where the user already explicitly authorised the tool).
+    if !original_user_intent.is_empty() {
+        safety
+            .llm_judge_tool_call(tool_name, params, original_user_intent)
+            .await?;
     }
 
     let safe_params = redact_params(params, tool.sensitive_params());
@@ -1526,6 +1566,7 @@ mod tests {
             "echo",
             &serde_json::json!({"message": "hello"}),
             &job_ctx,
+            "",
         )
         .await;
 
@@ -1554,6 +1595,7 @@ mod tests {
             "nonexistent",
             &serde_json::json!({}),
             &job_ctx,
+            "",
         )
         .await;
 
