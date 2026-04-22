@@ -892,7 +892,11 @@ impl<'a> LoopDelegate for ChatDelegate<'a> {
                 user_id: self.message.user_id.clone(),
                 context: "chat".to_string(),
             };
-            match self.agent.hooks().run(&event).await {
+            let hook_ctx = crate::hooks::HookContext {
+                intent: Some(self.message.content.clone()),
+                ..Default::default()
+            };
+            match self.agent.hooks().run_with_context(&event, hook_ctx).await {
                 Err(crate::hooks::HookError::Rejected { reason }) => {
                     preflight.push((
                         tc,

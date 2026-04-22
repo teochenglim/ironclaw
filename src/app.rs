@@ -18,13 +18,14 @@ use crate::extensions::ExtensionManager;
 use crate::hooks::HookRegistry;
 use crate::llm::recording::HttpInterceptor;
 use crate::llm::{LlmProvider, LlmReloadHandle, RecordingLlm, SessionManager};
+use crate::safety::LlmProviderJudge;
 use crate::secrets::SecretsStore;
 use crate::tools::ToolRegistry;
 use crate::tools::mcp::{McpProcessManager, McpSessionManager};
 use crate::tools::wasm::SharedCredentialRegistry;
 use crate::tools::wasm::WasmToolRuntime;
 use crate::workspace::{EmbeddingCacheConfig, EmbeddingProvider, Workspace};
-use ironclaw_safety::SafetyLayer;
+use ironclaw_safety::{LlmJudge, LlmJudgeConfig, SafetyLayer};
 use ironclaw_skills::SkillRegistry;
 use ironclaw_skills::catalog::SkillCatalog;
 
@@ -1125,6 +1126,61 @@ impl AppBuilder {
                     summary_llm,
                 )))
                 .await;
+        }
+
+        // Register LLM-as-Judge hook when enabled.
+        // Provider selection (in priority order):
+        //   1. Dedicated judge endpoint: SAFETY_LLM_JUDGE_BASE_URL + SAFETY_LLM_JUDGE_API_KEY
+        //   2. Cheap LLM (CHEAP_LLM_BACKEND) if configured
+        //   3. Primary LLM (inherits all credentials from the main provider)
+        let judge_config = LlmJudgeConfig::from_env();
+        if judge_config.enabled {
+            let judge_provider: Arc<dyn LlmProvider> = match (
+                &judge_config.base_url,
+                &judge_config.api_key,
+            ) {
+                (Some(base_url), Some(api_key)) => {
+                    use crate::llm::config::RegistryProviderConfig;
+                    use crate::llm::registry::ProviderProtocol;
+                    let model = judge_config
+                        .model
+                        .clone()
+                        .unwrap_or_else(|| "gpt-4o-mini".to_string());
+                    let reg = RegistryProviderConfig {
+                        protocol: ProviderProtocol::OpenAiCompletions,
+                        provider_id: "judge".to_string(),
+                        api_key: Some(secrecy::SecretString::from(api_key.clone())),
+                        base_url: base_url.clone(),
+                        model: model.clone(),
+                        extra_headers: vec![],
+                        oauth_token: None,
+                        is_codex_chatgpt: false,
+                        refresh_token: None,
+                        auth_path: None,
+                        cache_retention: Default::default(),
+                        unsupported_params: vec![],
+                    };
+                    tracing::debug!(base_url = %base_url, model = %model, "LLM judge: dedicated provider");
+                    crate::llm::create_registry_provider(
+                        &reg,
+                        self.config.llm.request_timeout_secs,
+                    )
+                    .unwrap_or_else(|e| {
+                        tracing::warn!(error = %e, "Judge dedicated provider failed, falling back");
+                        cheap_llm.clone().unwrap_or_else(|| Arc::clone(&llm))
+                    })
+                }
+                _ => cheap_llm.clone().unwrap_or_else(|| Arc::clone(&llm)),
+            };
+            let judge_llm = Arc::new(LlmProviderJudge::new(
+                judge_provider,
+                judge_config.timeout_ms,
+            ));
+            let llm_judge = Arc::new(LlmJudge::new(judge_llm, judge_config));
+            hooks
+                .register(Arc::new(crate::hooks::LlmJudgeHook::new(llm_judge)))
+                .await;
+            tracing::debug!("LLM-as-Judge hook registered");
         }
 
         let agent_session_manager =
