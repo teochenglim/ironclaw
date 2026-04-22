@@ -86,6 +86,7 @@ mod tests {
             action_def,
             execution_mode: ExecutionMode::Interactive,
             auto_approved,
+            thread_goal: None,
         }
     }
 
