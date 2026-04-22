@@ -1532,6 +1532,11 @@ impl Agent {
                 }
             };
 
+            // Capture the original user message before the if-let moves resumed_turn.
+            // Needed to thread intent into BeforeToolCall hooks for deferred siblings.
+            let original_intent: Option<String> =
+                resumed_turn.as_ref().map(|(_, _, user_input, _)| user_input.clone());
+
             if let Some((turn_number, user_message_id, user_input, started_at)) = resumed_turn {
                 self.persist_processing_live_state(
                     thread_id,
@@ -1688,9 +1693,20 @@ impl Agent {
             }
 
             // === Phase 1: Preflight (sequential) ===
-            // Walk deferred tools checking approval. Collect runnable
-            // tools; stop at the first that needs approval.
-            let mut runnable: Vec<crate::llm::ToolCall> = Vec::new();
+            // Walk deferred tools checking approval and BeforeToolCall hooks.
+            // Only the explicitly-approved tool is exempt from hook evaluation;
+            // its deferred siblings are re-evaluated here.
+            //
+            // DeferredDecision encodes the per-tool preflight outcome. Using
+            // an inline enum keeps Phase 3 order-preserving without extra sorts.
+            enum DeferredDecision {
+                /// Tool passed all checks — execute in Phase 2.
+                Run(crate::llm::ToolCall),
+                /// BeforeToolCall hook rejected this sibling — produce an error
+                /// result without executing the tool.
+                HookBlocked(crate::llm::ToolCall, String),
+            }
+            let mut deferred_outcomes: Vec<DeferredDecision> = Vec::new();
             let mut approval_needed: Option<(
                 usize,
                 crate::llm::ToolCall,
@@ -1722,10 +1738,58 @@ impl Agent {
                         approval_needed = Some((idx, tc.clone(), tool, allow_always));
                         break; // remaining tools stay deferred
                     }
+
+                    // Re-run BeforeToolCall hooks for deferred siblings. The
+                    // directly-approved tool is already skipped (intent=None path
+                    // in the judge hook); siblings were never individually approved
+                    // and must go through the normal hook pipeline.
+                    if let Some(ref intent) = original_intent {
+                        use crate::hooks::{HookContext, HookError, HookEvent, HookOutcome};
+                        let hook_params =
+                            crate::tools::redact_params(&tc.arguments, tool.sensitive_params());
+                        let hook_event = HookEvent::ToolCall {
+                            tool_name: tc.name.clone(),
+                            parameters: hook_params,
+                            user_id: message.user_id.clone(),
+                            context: "chat".to_string(),
+                        };
+                        let hook_ctx = HookContext {
+                            intent: Some(intent.clone()),
+                            ..Default::default()
+                        };
+                        let blocked_reason =
+                            match self.hooks().run_with_context(&hook_event, hook_ctx).await {
+                                Err(HookError::Rejected { reason })
+                                | Ok(HookOutcome::Reject { reason }) => Some(reason),
+                                _ => None,
+                            };
+                        if let Some(reason) = blocked_reason {
+                            tracing::warn!(
+                                tool = %tc.name,
+                                reason = %reason,
+                                "BeforeToolCall hook blocked deferred sibling tool"
+                            );
+                            deferred_outcomes
+                                .push(DeferredDecision::HookBlocked(tc.clone(), reason));
+                            continue;
+                        }
+                    }
                 }
 
-                runnable.push(tc.clone());
+                deferred_outcomes.push(DeferredDecision::Run(tc.clone()));
             }
+
+            // Build the runnable list for Phase 2 from the Run decisions only.
+            let runnable: Vec<crate::llm::ToolCall> = deferred_outcomes
+                .iter()
+                .filter_map(|o| {
+                    if let DeferredDecision::Run(tc) = o {
+                        Some(tc.clone())
+                    } else {
+                        None
+                    }
+                })
+                .collect();
 
             // === Phase 2: Parallel execution ===
             let exec_results: Vec<(crate::llm::ToolCall, Result<String, Error>)> = if runnable.len()
@@ -1870,8 +1934,30 @@ impl Agent {
             // === Phase 3: Post-flight (sequential, in original order) ===
             // Process all results before any conditional return so every
             // tool result is recorded in the session audit trail.
+            //
+            // Merge Phase 2 execution results with Phase 1 hook-blocked errors,
+            // restoring the original deferred_tool_calls order. The LLM needs
+            // a tool_result for every tool_use ID in the assistant message.
+            let mut exec_iter = exec_results.into_iter();
+            let all_deferred_results: Vec<(crate::llm::ToolCall, Result<String, Error>)> =
+                deferred_outcomes
+                    .into_iter()
+                    .map(|outcome| match outcome {
+                        DeferredDecision::Run(_) => exec_iter
+                            .next()
+                            .expect("exec_results count must match Run decisions"),
+                        DeferredDecision::HookBlocked(tc, reason) => {
+                            let err: Error = crate::error::ToolError::ExecutionFailed {
+                                name: tc.name.clone(),
+                                reason: format!("Blocked by hook: {reason}"),
+                            }
+                            .into();
+                            (tc, Err(err))
+                        }
+                    })
+                    .collect();
 
-            for (tc, deferred_result) in exec_results {
+            for (tc, deferred_result) in all_deferred_results {
                 if let Ok(ref output) = deferred_result
                     && !output.is_empty()
                 {

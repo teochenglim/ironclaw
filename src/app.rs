@@ -1135,6 +1135,27 @@ impl AppBuilder {
         //   3. Primary LLM (inherits all credentials from the main provider)
         let judge_config = LlmJudgeConfig::from_env();
         if judge_config.enabled {
+            // Partial dedicated-endpoint config is a misconfiguration: if only
+            // one of BASE_URL / API_KEY is set, the judge silently falls back to
+            // the primary LLM — undermining the isolation guarantee. Warn loudly
+            // so operators don't believe they configured an isolated judge when
+            // they haven't.
+            match (&judge_config.base_url, &judge_config.api_key) {
+                (Some(_), None) => tracing::warn!(
+                    "LLM judge: SAFETY_LLM_JUDGE_BASE_URL is set but \
+                     SAFETY_LLM_JUDGE_API_KEY is missing — dedicated judge \
+                     endpoint will NOT be used; falling back to primary LLM. \
+                     Set both vars together or neither."
+                ),
+                (None, Some(_)) => tracing::warn!(
+                    "LLM judge: SAFETY_LLM_JUDGE_API_KEY is set but \
+                     SAFETY_LLM_JUDGE_BASE_URL is missing — dedicated judge \
+                     endpoint will NOT be used; falling back to primary LLM. \
+                     Set both vars together or neither."
+                ),
+                _ => {} // both set (dedicated path) or neither (fallback path) — ok
+            }
+
             let judge_provider: Arc<dyn LlmProvider> = match (
                 &judge_config.base_url,
                 &judge_config.api_key,
@@ -1166,7 +1187,15 @@ impl AppBuilder {
                         self.config.llm.request_timeout_secs,
                     )
                     .unwrap_or_else(|e| {
-                        tracing::warn!(error = %e, "Judge dedicated provider failed, falling back");
+                        // Dedicated endpoint was explicitly configured but failed
+                        // to initialise — warn loudly since the operator believes
+                        // they have an isolated judge when they don't.
+                        tracing::warn!(
+                            error = %e,
+                            "LLM judge: dedicated provider failed to initialise — \
+                             falling back to primary LLM. The judge will NOT use \
+                             the configured isolated endpoint."
+                        );
                         cheap_llm.clone().unwrap_or_else(|| Arc::clone(&llm))
                     })
                 }

@@ -200,7 +200,10 @@ impl ExecutionGate for HookGate {
             context: format!("gate:{}", ctx.thread_id),
         };
 
-        match self.hooks.run(&hook_event).await {
+        // Engine-v2 gate path does not carry the originating user intent —
+        // pass an explicit default so the skip decision is visible here rather
+        // than silently inherited from HookRegistry::run's default context.
+        match self.hooks.run_with_context(&hook_event, crate::hooks::HookContext::default()).await {
             Ok(crate::hooks::HookOutcome::Reject { reason }) => GateDecision::Deny {
                 reason: format!("Tool '{}' blocked by hook: {reason}", ctx.action_name),
             },

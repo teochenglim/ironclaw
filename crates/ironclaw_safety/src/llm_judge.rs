@@ -213,8 +213,30 @@ impl LlmJudge {
             return fail_ambiguous(&req.tool_name, latency_ms, "Empty user intent");
         }
 
-        let args_str = serde_json::to_string_pretty(&req.tool_args)
-            .unwrap_or_else(|_| req.tool_args.to_string());
+        // Cap tool argument serialisation to prevent resource-exhaustion attacks
+        // and runaway cost on large payloads (file_write, memory_write, shell
+        // heredocs, etc.). Large arguments are truncated with a sentinel suffix
+        // so the judge still sees the tool name and the beginning of the payload —
+        // enough to detect intent mismatches — without paying for the full blob.
+        const ARGS_MAX_BYTES: usize = 2048;
+        let args_str: String = {
+            let full = serde_json::to_string_pretty(&req.tool_args)
+                .unwrap_or_else(|_| req.tool_args.to_string());
+            if full.len() > ARGS_MAX_BYTES {
+                // Truncate at a char boundary to avoid splitting a multi-byte sequence.
+                let truncate_at = (0..=ARGS_MAX_BYTES)
+                    .rev()
+                    .find(|&i| full.is_char_boundary(i))
+                    .unwrap_or(0);
+                format!(
+                    "{}... [truncated {} bytes]",
+                    &full[..truncate_at],
+                    full.len() - truncate_at
+                )
+            } else {
+                full
+            }
+        };
 
         // Escape user-controlled values before embedding in the prompt.
         // Replacing "</" prevents XML closing-tag injection — a crafted intent
@@ -732,6 +754,57 @@ mod tests {
             "fail_open confidence should be 0.0, not 1.0"
         );
         assert!(record.reasoning.contains("unavailable"));
+    }
+
+    #[tokio::test]
+    async fn integration_large_args_are_truncated() {
+        // Construct a payload large enough to exceed ARGS_MAX_BYTES (2048).
+        // The judge must still be called (not errored) and the prompt must
+        // contain the truncation sentinel rather than the full blob.
+        let big_value = "x".repeat(4096);
+
+        struct CapturingJudgeLlm {
+            captured: std::sync::Mutex<Option<String>>,
+        }
+        #[async_trait::async_trait]
+        impl JudgeLlm for CapturingJudgeLlm {
+            async fn complete_text(
+                &self,
+                _system: &str,
+                user: &str,
+                _model_override: Option<&str>,
+                _max_tokens: u32,
+            ) -> Result<String, String> {
+                *self.captured.lock().unwrap() = Some(user.to_string());
+                Ok(r#"{"verdict":"Allow","attack_type":null,"confidence":0.95,"reasoning":"ok"}"#
+                    .to_string())
+            }
+        }
+
+        let capturing_llm = Arc::new(CapturingJudgeLlm {
+            captured: std::sync::Mutex::new(None),
+        });
+        let judge = LlmJudge::new(capturing_llm.clone(), make_config(true));
+        let req = ToolCallRequest {
+            tool_name: "file_write".to_string(),
+            tool_args: serde_json::json!({"content": big_value}),
+            original_user_intent: "write a file".to_string(),
+        };
+        let (verdict, _) = judge.evaluate(&req).await;
+        assert_eq!(verdict, JudgeVerdict::Allow);
+
+        let prompt = capturing_llm.captured.lock().unwrap().clone().unwrap();
+        assert!(
+            prompt.contains("[truncated"),
+            "prompt should contain truncation sentinel, got length {}",
+            prompt.len()
+        );
+        // The full prompt should be bounded well below the raw payload size.
+        assert!(
+            prompt.len() < 4096,
+            "truncated prompt should be much shorter than the raw 4096-byte payload, got {}",
+            prompt.len()
+        );
     }
 
     #[test]

@@ -1157,7 +1157,10 @@ impl EffectBridgeAdapter {
             context: format!("engine_v2:{}", context.thread_id),
         };
 
-        match self.hooks.run(&hook_event).await {
+        // Engine-v2 capability execution does not carry the originating user
+        // intent — pass an explicit default so the skip decision is visible
+        // here rather than silently inherited from HookRegistry::run.
+        match self.hooks.run_with_context(&hook_event, crate::hooks::HookContext::default()).await {
             Ok(HookOutcome::Reject { reason }) => {
                 return Err(EngineError::LeaseDenied {
                     reason: format!("Tool '{}' blocked by hook: {}", action_name, reason),

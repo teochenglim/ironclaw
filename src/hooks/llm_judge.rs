@@ -68,8 +68,12 @@ impl Hook for LlmJudgeHook {
             return Ok(HookOutcome::ok());
         };
 
-        // Skip when intent is absent — job workers, approval-resumed calls, and
-        // any path where the originating user message is unavailable.
+        // Skip when intent is absent.
+        // - Interactive chat (dispatcher.rs): always has intent.
+        // - Autonomous job workers (job.rs): pass the job description as intent.
+        // - Engine-v2 / gate paths: no user intent available, judge is skipped.
+        // - Approval-resumed calls: the directly-approved call is skipped here;
+        //   deferred siblings are re-evaluated by process_approval in thread_ops.
         let Some(intent) = ctx.intent.as_deref() else {
             return Ok(HookOutcome::ok());
         };
